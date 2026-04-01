@@ -1,0 +1,6 @@
+zyte-api
+beautifulsoup4
+langchain-anthropic
+langchain
+pydantic
+python-dotenv
