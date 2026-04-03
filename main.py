@@ -10,7 +10,13 @@ Orchestrateur principal du pipeline :
 =============================================================================
 """
 
+import argparse
 import asyncio
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from modules.m1_prospect_finder import ProspectFinder
 
@@ -19,26 +25,87 @@ from modules.m1_prospect_finder import ProspectFinder
 # from modules.m4_sequencer import Sequencer                # TODO: M4
 
 
-async def main():
-    agent = ProspectFinder(output_file="runs/prospects.jsonl")
-
-    raw_phrase = (
-        "Je vends un logiciel de devis et soumissions (génération depuis templates, "
-        "suivi en temps réel, signature électronique) au Québec pour deux profils équivalents : "
-
-        "PROFIL A — PME 2 à 50 employés en construction et rénovation "
-        "(entrepreneurs généraux, électriciens, plombiers, menuisiers, peintres, paysagistes) "
-        "qui envoient des soumissions de travaux sur Word/Excel ou papier. "
-
-        "PROFIL B — Professionnels indépendants ou petits cabinets 1 à 10 personnes "
-        "qui envoient des propositions d'honoraires, lettres de mandat ou contrats de service "
-        "avant de débuter leur travail : notaires, avocats, fiscalistes, comptables CPA, "
-        "psychologues, dentistes, évaluateurs agréés, arpenteurs, ingénieurs conseil. "
-        "Ces professionnels ont exactement le même besoin : formaliser, envoyer et faire "
-        "signer un document de prix avant de commencer — sans système dédié aujourd'hui. "
-
-        "Les deux profils envoient 5 à 20 de ces documents par mois."
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Agent Commercial Autonome — Recherche et qualification de prospects"
     )
+    parser.add_argument(
+        "--phrase", "-p",
+        type=str,
+        default=None,
+        help="Description de votre offre et du prospect cible (si non fourni, prompt interactif)"
+    )
+    parser.add_argument(
+        "--target", "-t",
+        type=int,
+        default=20,
+        help="Nombre de prospects à trouver (défaut: 20)"
+    )
+    parser.add_argument(
+        "--output", "-o",
+        type=str,
+        default="runs/prospects.jsonl",
+        help="Fichier de sortie JSONL (défaut: runs/prospects.jsonl)"
+    )
+    return parser.parse_args()
+
+
+def _params_for_target(target: int) -> dict:
+    """
+    Calcule max_urls et serp_pages selon le nombre de prospects visés.
+    Hypothèse : ~30% des URLs candidates deviennent des prospects valides.
+    Donc candidats nécessaires = target / 0.30.
+    serp_pages et max_urls sont ajustés pour couvrir ce volume.
+
+    | Cible | Candidats nécessaires | serp_pages | max_urls | Coût estimé |
+    |-------|-----------------------|------------|----------|-------------|
+    |    20 |          ~67          |     1      |    80    |   ~$0.03    |
+    |    50 |         ~167          |     2      |   200    |   ~$0.08    |
+    |   100 |         ~334          |     3      |   400    |   ~$0.15    |
+    |   200 |         ~667          |     5      |   800    |   ~$0.28    |
+    """
+    needed = int(target / 0.30)
+    if needed <= 80:
+        return {"serp_pages": 1, "max_urls": 80}
+    elif needed <= 200:
+        return {"serp_pages": 2, "max_urls": 200}
+    elif needed <= 400:
+        return {"serp_pages": 3, "max_urls": 400}
+    else:
+        return {"serp_pages": 5, "max_urls": 800}
+
+
+async def main():
+    args = parse_args()
+
+    # Phrase commerciale : CLI ou prompt interactif
+    raw_phrase = args.phrase
+    if not raw_phrase:
+        print("\n" + "=" * 60)
+        print("AGENT COMMERCIAL AUTONOME — M1 Prospect Finder")
+        print("=" * 60)
+        print("\nDécrivez votre offre et votre prospect cible.")
+        print("Exemple : 'Je vends un CRM aux PME françaises de 10-50 employés...'")
+        print("-" * 60)
+        raw_phrase = input("\nVotre description : ").strip()
+        if not raw_phrase:
+            print("Description vide. Arrêt.")
+            return
+
+    target = args.target
+    params = _params_for_target(target)
+
+    print("\n" + "=" * 60)
+    print("CONFIGURATION DU RUN")
+    print("=" * 60)
+    print(f"  Cible            : {target} prospects")
+    print(f"  Pages SERP       : {params['serp_pages']} par requête")
+    print(f"  Max URLs         : {params['max_urls']} candidats")
+    print(f"  Modèle LLM       : {os.getenv('OLLAMA_MODEL', 'llama3.2')} (Ollama Cloud)")
+    print(f"  Sortie           : {args.output}")
+
+    agent = ProspectFinder(output_file=args.output)
+
     print("\n" + "=" * 60)
     print("ÉTAPE 0 — GÉNÉRATION DE L'ICP")
     print("=" * 60)
@@ -68,9 +135,12 @@ async def main():
         icp_description=icp_description,
         offer_type=offer_type,
         sub_sectors=icp.sub_sectors,
-        max_urls=20,
-        max_concurrent_validations=3,
+        max_urls=params["max_urls"],
+        serp_pages=params["serp_pages"],
+        max_concurrent_validations=1,  # séquentiel, respecte la limite 50k tokens/min
         extra_excluded_domains=extra_excluded,
+        icp_summary=icp.icp_description,
+        geography=icp.geography,
     )
 
     print("\n" + "=" * 60)
@@ -84,8 +154,10 @@ async def main():
         print(f"  URL         : {p.get('url')}")
         print("  " + "-" * 40)
 
-    print(f"\nCoût total : ${agent.tracker.estimated_cost_usd:.5f} USD")
-    print(f"Résultats  : {agent.output_path}")
+    summary = agent.tracker.summary()
+    print(f"\nTokens utilisés : {summary['input_tokens']} in / {summary['output_tokens']} out")
+    print(f"Modèle Ollama   : {summary.get('model', 'N/A')}")
+    print(f"Résultats       : {agent.output_path}")
 
 
 if __name__ == "__main__":

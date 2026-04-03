@@ -1,6 +1,8 @@
 zyte-api
 beautifulsoup4
-langchain-anthropic
+langchain-ollama
+langchain-community
+langchain-core
 langchain
 pydantic
 python-dotenv

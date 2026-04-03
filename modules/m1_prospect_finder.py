@@ -1,36 +1,31 @@
 """
 =============================================================================
-MODULE 1 : RECHERCHE & QUALIFICATION DE PROSPECTS — v4
+MODULE 1 : RECHERCHE & QUALIFICATION DE PROSPECTS — v6
 Agent Commercial Autonome — Brique Fondatrice
 =============================================================================
-Améliorations v3 :
-  [1] offer_type transmis jusqu'à la validation (contexte métier complet)
-  [2] Filtre de domaines exclus avant validation (pas de Wikipedia/LinkedIn)
-  [3] Fetch adaptatif : httpResponseBody d'abord, browserHtml si vide
-  [4] Déduplication par domaine (pas par URL exacte)
-  [5] Ordre SERP préservé (les meilleurs résultats passent en premier)
-  [6] Persistance temps réel (crash-safe, flush JSON à chaque prospect)
-  [7] Génération des dorks via SystemMessage/HumanMessage + prompt caching
-  [8] Tracking des coûts tokens (input / output / cache) par run
+Améliorations v6 — Migration Ollama Cloud :
+  [O1] Remplacement de ChatAnthropic par ChatOllama (modèles open source)
+  [O2] Authentification via OLLAMA_API_KEY (créer sur https://ollama.com/settings)
+  [O3] URL par défaut : https://ollama.com (Ollama Cloud)
+  [O4] Variable OLLAMA_MODEL pour choisir le modèle
+  [O5] Suppression du prompt caching (non supporté par Ollama)
+  [O6] Coût = $0 (modèles cloud avec quota gratuit)
 
-Optimisations cache v4 :
-  [C1] PROBLÈME CORRIGÉ : aucun prompt n'atteignait le minimum de 1024 tokens
-       requis par Anthropic pour activer le cache sur Haiku → cache_control
-       était annoté mais ne déclenchait rien.
-  [C2] _SYSTEM_VALIDATION enrichi de few-shots exemples → franchit les 1024
-       tokens → cache s'active réellement.
-  [C3] ICP + offer_type déplacés du user_message vers le system_message de
-       validation (ils sont constants sur tout le run) → le bloc caché est
-       identique byte-pour-byte sur les N appels de validation → cache hit
-       garanti dès le 2ème appel.
-  [C4] system_message de validation construit UNE SEULE FOIS dans run() et
-       passé à chaque appel → garantie supplémentaire d'identité du bloc.
-  [C5] asyncio.Lock() instancié en attribut de classe (self._file_lock)
-       et non plus à chaque appel (chaque new Lock() est indépendant →
-       protection illusoire en contexte concurrent).
-  [C6] _SYSTEM_ICP et _SYSTEM_DORKS : appelés une seule fois par run,
-       le cache ne profite qu'aux runs multiples (TTL 5 min). Conservé
-       mais documenté comme "cross-run" uniquement.
+Améliorations v5 — Généricité :
+  [G1] Few-shots générés dynamiquement via generate_few_shots()
+  [G2] Géographie configurable via extract_geo_code()
+  [G3] main.py accepte --phrase en argument CLI
+  [G4] Paramètre icp_summary optionnel
+
+Améliorations v3-v4 :
+  [1] offer_type transmis jusqu'à la validation
+  [2] Filtre de domaines exclus avant validation
+  [3] Fetch adaptatif : httpResponseBody d'abord, browserHtml si vide
+  [4] Déduplication par domaine
+  [5] Ordre SERP préservé
+  [6] Persistance temps réel (crash-safe)
+  [7] Génération des dorks via SystemMessage/HumanMessage
+  [8] Tracking des tokens par run
 =============================================================================
 """
 
@@ -42,18 +37,18 @@ import os
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 
 from zyte_api import AsyncZyteAPI
 from bs4 import BeautifulSoup
-from langchain_anthropic import ChatAnthropic
+from langchain_ollama import ChatOllama
 from langchain_core.messages import SystemMessage, HumanMessage
 from pydantic import ValidationError
 from dotenv import load_dotenv
 
 from core.schemas import ICPProfile, ProspectValid, ProspectInvalid
 from core.token_tracker import TokenTracker
-from core.utils import EXCLUDED_DOMAINS, retry_async, parse_llm_json, filter_and_deduplicate_urls
+from core.utils import EXCLUDED_DOMAINS, retry_async, parse_llm_json, filter_and_deduplicate_urls, extract_root_domain, extract_geo_code
 
 # =============================================================================
 # CONFIGURATION
@@ -61,12 +56,19 @@ from core.utils import EXCLUDED_DOMAINS, retry_async, parse_llm_json, filter_and
 
 load_dotenv()
 
-ZYTE_API_KEY      = os.getenv("ZYTE_API_KEY")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+ZYTE_API_KEY = os.getenv("ZYTE_API_KEY")
+OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "https://ollama.com")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
 
-if not ZYTE_API_KEY or not ANTHROPIC_API_KEY:
+if not ZYTE_API_KEY:
     raise EnvironmentError(
-        "Variables manquantes dans .env : ZYTE_API_KEY et/ou ANTHROPIC_API_KEY"
+        "Variable manquante dans .env : ZYTE_API_KEY"
+    )
+if not OLLAMA_API_KEY:
+    raise EnvironmentError(
+        "Variable manquante dans .env : OLLAMA_API_KEY\n"
+        "Créez une clé sur https://ollama.com/settings"
     )
 
 logging.basicConfig(
@@ -125,10 +127,13 @@ tu extrais et enrichis toutes les dimensions nécessaires :
 <output_rules>
 Retourne UNIQUEMENT un objet JSON valide respectant exactement ce schéma.
 Aucun texte avant ou après. Tous les champs sont obligatoires.
+IMPORTANT pour sub_sectors : génère UN sous-secteur distinct pour chaque type de profession
+ou secteur cité dans la phrase. Si 10 professions sont mentionnées, tu dois avoir ~10 sous-secteurs.
+Ne regroupe jamais des professions distinctes en un seul sous-secteur générique.
 
 {
   "sector": "Secteur principal",
-  "sub_sectors": ["sous-secteur 1", "sous-secteur 2"],
+  "sub_sectors": ["sous-secteur 1", "sous-secteur 2", "...un sous-secteur distinct par type de profession ou secteur cité"],
   "company_size": "X à Y employés",
   "geography": "Ville/Région/Pays ciblé",
   "decision_maker_title": ["Titre décideur 1", "Titre décideur 2"],
@@ -156,10 +161,12 @@ Chaque dork doit :
   pages "À propos", "Équipe", "Contact", annonces de recrutement, communiqués de croissance
 - Rester dans la géographie de l'ICP
 - Éviter les annuaires, les job boards et les médias généralistes
+- JAMAIS utiliser filetype:pdf — les PDFs sont illisibles et gaspillent des appels
+- Toujours ajouter -filetype:pdf à chaque requête
 </strategy>
 
 <output_rules>
-Retourne UNIQUEMENT un tableau JSON de chaînes. Maximum 10 éléments. Aucun texte avant ou après.
+Retourne UNIQUEMENT un tableau JSON de chaînes. Maximum 20 éléments. Aucun texte avant ou après.
 Exemple : ["intitle:\\"À propos\\" \\"BTP\\" \\"Québec\\"", "intext:\\"recrutement\\" \\"construction\\" site:.ca"]
 </output_rules>
 """
@@ -169,6 +176,9 @@ Exemple : ["intitle:\\"À propos\\" \\"BTP\\" \\"Québec\\"", "intext:\\"recrute
     # FOIS dans run() via _build_validation_system_msg().
     # Les few-shots exemples (~600 tokens) + instructions (~400 tokens)
     # + ICP injecté (~300 tokens) → total > 1024 tokens → cache activé.
+    # Template de validation SANS few-shots hardcodés.
+    # Les few-shots sont générés dynamiquement via generate_few_shots()
+    # et injectés via le placeholder {few_shot_examples}.
     _SYSTEM_VALIDATION_TEMPLATE = """
 <role>
 Tu es un analyste commercial senior spécialisé en qualification B2B.
@@ -199,47 +209,7 @@ Offre commercialisée : {offer_type}
 </analysis_steps>
 
 <few_shot_examples>
-EXEMPLE 1 — Prospect VALIDE
-Offre : Service de gestion de paie externalisée
-ICP : PME manufacturières, 50-200 employés, Ontario, Canada
-Contenu site analysé : "Fondée en 1998, Métaux Brampton Inc. est spécialisée
-dans la fabrication de pièces d'aluminium pour l'industrie automobile.
-Nos 85 employés opèrent sur 3 lignes de production. Nous recrutons
-actuellement un contrôleur financier pour accompagner notre croissance."
-Résultat attendu :
-{{"valid": true, "company_name": "Métaux Brampton Inc.", "industry": "Fabrication / Aluminium",
- "signals": ["85 employés confirmés", "recrutement contrôleur financier = signal de croissance financière"],
- "fit_reason": "PME manufacturière ontarienne de 85 employés en croissance, cherche du renfort financier — besoin probable d'externalisation de paie."}}
-
-EXEMPLE 2 — Prospect INVALIDE (hors géographie)
-Offre : Service de gestion de paie externalisée
-ICP : PME manufacturières, 50-200 employés, Ontario, Canada
-Contenu site analysé : "TechnoPlast SAS est une PME industrielle basée à Lyon,
-France, spécialisée dans l'injection plastique depuis 2005. 120 collaborateurs."
-Résultat attendu :
-{{"valid": false, "reason": "Entreprise française (Lyon), hors zone géographique ICP (Ontario, Canada)."}}
-
-EXEMPLE 3 — Prospect INVALIDE (mauvais secteur)
-Offre : Logiciel de gestion de chantier BTP
-ICP : Entreprises de construction, Québec, 10-100 employés
-Contenu site analysé : "Cabinet Beaumont & Associés, experts-comptables à
-Montréal depuis 1987. Notre équipe de 25 professionnels vous accompagne
-dans vos obligations fiscales et comptables."
-Résultat attendu :
-{{"valid": false, "reason": "Cabinet comptable, pas une entreprise de construction."}}
-
-EXEMPLE 4 — Prospect VALIDE avec signal fort
-Offre : Logiciel de gestion de chantier BTP
-ICP : Entreprises de construction, Québec, 10-100 employés
-Contenu site analysé : "Construction Dallaire, entrepreneur général à Québec.
-Depuis 2010, nous réalisons des projets résidentiels et commerciaux partout
-en Chaudière-Appalaches. Équipe de 40 charpentiers et gestionnaires de projet.
-Nous cherchons à améliorer le suivi de nos chantiers. Poste ouvert :
-coordonnateur de chantier."
-Résultat attendu :
-{{"valid": true, "company_name": "Construction Dallaire", "industry": "Construction / Entrepreneur général",
- "signals": ["40 employés", "recrutement coordonnateur chantier", "mention explicite d'un besoin de suivi de chantier"],
- "fit_reason": "Entrepreneur général québécois de 40 employés cherchant explicitement à améliorer le suivi de chantier — besoin direct pour un logiciel de gestion BTP."}}
+{few_shot_examples}
 </few_shot_examples>
 
 <output_rules>
@@ -247,64 +217,154 @@ Retourne UNIQUEMENT un objet JSON valide. Aucun texte avant ou après.
 Si VALIDE :
   {{"valid": true, "company_name": "...", "industry": "...", "signals": ["..."], "fit_reason": "Explication du besoin pour l'offre spécifique"}}
 Si INVALIDE :
-  {{"valid": false, "reason": "Raison concise (géographie, secteur, taille, ou autre)"}}
+  {{"valid": false, "reason": "Raison concise, MAX 20 mots (ex: hors géo, secteur public, trop grand, annuaire, PDF illisible)"}}
+</output_rules>
+"""
+
+    # Prompt pour générer les few-shots dynamiques
+    _SYSTEM_FEW_SHOTS = """
+<role>
+Tu es un expert en création d'exemples d'entraînement pour la qualification B2B.
+Tu génères des exemples réalistes qui illustrent comment qualifier des prospects
+selon un ICP et une offre spécifiques.
+</role>
+
+<task>
+Génère 3 exemples de qualification de prospects :
+- 2 exemples VALIDE (avec des raisons de fit différentes)
+- 1 exemple INVALIDE (raison typique : mauvaise taille, mauvaise géographie, hors cible)
+
+Chaque exemple doit être cohérent avec l'ICP et l'offre fournis.
+Les exemples doivent illustrer des cas variés mais réalistes.
+</task>
+
+<output_rules>
+Retourne UNIQUEMENT un tableau JSON de 3 objets. Format de chaque objet :
+{
+  "description": "EXEMPLE N — Prospect VALIDE/INVALIDE (raison courte)",
+  "offer": "Type d'offre",
+  "icp_summary": "Résumé de l'ICP",
+  "site_content": "Contenu fictif mais réaliste du site web analysé",
+  "result": {"valid": true/false, ...}
+}
+Aucun texte avant ou après. JSON strictement valide.
 </output_rules>
 """
 
     def __init__(self, output_file: str = "prospects_output.jsonl"):
         self.zyte_client = AsyncZyteAPI(api_key=ZYTE_API_KEY)
-        self.llm = ChatAnthropic(
-            model="claude-haiku-4-5-20251001",
+
+        # Client Ollama via langchain-ollama
+        ollama_headers = {"Authorization": f"Bearer {OLLAMA_API_KEY}"}
+
+        self.llm = ChatOllama(
+            model=OLLAMA_MODEL,
+            base_url=OLLAMA_BASE_URL,
             temperature=0.2,
-            api_key=ANTHROPIC_API_KEY,
-            max_tokens=1024,
+            num_predict=8192,
+            client_kwargs={"headers": ollama_headers},
         )
+
+        self.llm_validate = ChatOllama(
+            model=OLLAMA_MODEL,
+            base_url=OLLAMA_BASE_URL,
+            temperature=0.1,
+            num_predict=1024,
+            client_kwargs={"headers": ollama_headers},
+        )
+
         self.tracker = TokenTracker()
 
         self.output_path = Path(output_file)
+        self.rejected_path = self.output_path.parent / "rejected.jsonl"
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        # [C5] Lock instancié UNE SEULE FOIS — partagé par tous les appels
-        # concurrents à _persist_prospect. Instancier Lock() dans la méthode
-        # crée un verrou indépendant à chaque appel → protection illusoire.
         self._file_lock = asyncio.Lock()
 
     # -------------------------------------------------------------------------
-    # [C3][C4] Construction du system message de validation (une fois par run)
+    # Helper
     # -------------------------------------------------------------------------
 
+    def _track(self, response):
+        meta = getattr(response, "usage_metadata", None) or {}
+        self.tracker.record(meta)
+
+    # -------------------------------------------------------------------------
+    # Construction du system message de validation
+    # -------------------------------------------------------------------------
+
+    async def generate_few_shots(
+        self, icp_description: str, offer_type: str, icp_summary: str
+    ) -> str:
+        """
+        Génère 3 exemples de qualification dynamiquement basés sur l'ICP.
+        Ces exemples sont injectés dans le prompt de validation pour
+        adapter le few-shot learning au contexte spécifique de l'offre.
+        """
+        system_msg = SystemMessage(content=self._SYSTEM_FEW_SHOTS)
+        user_msg = HumanMessage(content=(
+            f"<offer_type>{offer_type}</offer_type>\n\n"
+            f"<icp_description>{icp_description}</icp_description>\n\n"
+            f"<icp_summary>{icp_summary}</icp_summary>\n\n"
+            "Génère 3 exemples de qualification réalistes pour ce contexte."
+        ))
+
+        response = await self.llm.ainvoke([system_msg, user_msg])
+        self._track(response)
+
+        parsed = parse_llm_json(response.content)
+        if not isinstance(parsed, list) or len(parsed) < 3:
+            logger.warning("[few_shots] Échec génération, utilisation exemples génériques")
+            return self._fallback_few_shots()
+
+        # Formate les exemples en texte pour injection dans le prompt
+        examples_text = []
+        for i, ex in enumerate(parsed[:3], 1):
+            examples_text.append(
+                f"EXEMPLE {i} — {ex.get('description', f'Prospect {i}')}\n"
+                f"Offre : {ex.get('offer', offer_type)}\n"
+                f"ICP : {ex.get('icp_summary', icp_summary)}\n"
+                f"Contenu site analysé : \"{ex.get('site_content', 'Contenu non spécifié')}\"\n"
+                f"Résultat attendu :\n{json.dumps(ex.get('result', {}), ensure_ascii=False)}"
+            )
+
+        logger.info(f"[few_shots] {len(examples_text)} exemples générés")
+        return "\n\n".join(examples_text)
+
+    def _fallback_few_shots(self) -> str:
+        """Exemples génériques de fallback si la génération dynamique échoue."""
+        return """EXEMPLE 1 — Prospect VALIDE (correspondance ICP)
+Offre : Offre commerciale
+ICP : Profil cible défini
+Contenu site analysé : "Entreprise correspondant au profil ICP avec signaux d'achat visibles."
+Résultat attendu :
+{"valid": true, "company_name": "Exemple Entreprise", "industry": "Secteur", "signals": ["Signal 1", "Signal 2"], "fit_reason": "Correspond au profil ICP et présente des signaux de besoin."}
+
+EXEMPLE 2 — Prospect VALIDE (avec signaux forts)
+Offre : Offre commerciale
+ICP : Profil cible défini
+Contenu site analysé : "Entreprise en croissance avec besoins identifiés correspondant à l'offre."
+Résultat attendu :
+{"valid": true, "company_name": "Exemple Croissance", "industry": "Secteur", "signals": ["Signal croissance", "Besoin identifié"], "fit_reason": "En croissance et besoin explicite de l'offre."}
+
+EXEMPLE 3 — Prospect INVALIDE (hors cible)
+Offre : Offre commerciale
+ICP : Profil cible défini
+Contenu site analysé : "Entreprise ne correspondant pas aux critères ICP."
+Résultat attendu :
+{"valid": false, "reason": "Hors cible ICP."}"""
+
     def _build_validation_system_msg(
-        self, icp_criteria: str, offer_type: str
+        self, icp_criteria: str, offer_type: str, few_shot_examples: str = ""
     ) -> SystemMessage:
         """
-        Construit le SystemMessage de validation en injectant l'ICP et
-        l'offer_type dans le template statique.
-
-        Pourquoi construire ici plutôt que dans _validate_raw ?
-        → Le message doit être byte-pour-byte IDENTIQUE sur tous les appels
-          de validation du run pour que le cache Anthropic soit hit.
-          Si on le construisait dans _validate_raw, une différence de whitespace
-          ou d'encodage pourrait invalider le cache silencieusement.
-
-        Taille estimée du bloc mis en cache :
-          - Instructions + few-shots : ~900 tokens
-          - ICP injecté              : ~200-400 tokens (variable)
-          - offer_type               : ~20-50 tokens
-          Total                      : ~1120-1350 tokens → au-dessus du seuil
-          de 1024 tokens requis par Claude Haiku pour activer le cache.
+        Construit le SystemMessage de validation.
         """
         filled_prompt = self._SYSTEM_VALIDATION_TEMPLATE.format(
             offer_type=offer_type,
             icp_criteria=icp_criteria,
+            few_shot_examples=few_shot_examples or self._fallback_few_shots(),
         )
-        return SystemMessage(content=[{
-            "type": "text",
-            "text": filled_prompt,
-            # cache_control active le cache Anthropic sur ce bloc.
-            # Coût : écriture facturée à 1.25x lors du 1er appel.
-            # Bénéfice : tous les appels suivants lisent au cache à 0.1x.
-            # Break-even : dès le 2ème appel de validation dans le run.
-            "cache_control": {"type": "ephemeral"},
-        }])
+        return SystemMessage(content=filled_prompt)
 
     # -------------------------------------------------------------------------
     # Persistance temps réel [C5]
@@ -313,24 +373,52 @@ Si INVALIDE :
     async def _persist_prospect(self, prospect: dict):
         """Écrit immédiatement un prospect validé dans le fichier JSONL."""
         prospect["saved_at"] = datetime.utcnow().isoformat()
-        async with self._file_lock:   # [C5] self._file_lock, pas asyncio.Lock()
+        async with self._file_lock:
             with self.output_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(prospect, ensure_ascii=False) + "\n")
         logger.info(f"[persist] Prospect sauvegardé : {prospect.get('company_name')}")
 
+    async def _persist_rejected(self, url: str, reason: str):
+        """Écrit immédiatement un prospect rejeté dans rejected.jsonl."""
+        record = {"url": url, "reason": reason, "rejected_at": datetime.utcnow().isoformat()}
+        async with self._file_lock:
+            with self.rejected_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
     # -------------------------------------------------------------------------
-    # Helper tracking tokens
+    # Chargement des domaines déjà prospectés
     # -------------------------------------------------------------------------
 
-    def _track(self, response):
-        meta = getattr(response, "usage_metadata", None) or {}
-        self.tracker.record(meta)
+    def _load_seen_domains(self) -> set[str]:
+        """
+        Charge les domaines racines depuis prospects.jsonl ET rejected.jsonl.
+        Aucun domaine déjà visité (valide ou invalide) ne sera re-analysé.
+        """
+        seen = set()
+        for path in (self.output_path, self.rejected_path):
+            if not path.exists():
+                continue
+            with path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                        url = record.get("url", "")
+                        if url:
+                            seen.add(extract_root_domain(urlparse(url).netloc))
+                    except json.JSONDecodeError:
+                        continue
+        if seen:
+            logger.info(f"[seen] {len(seen)} domaines déjà visités chargés (valides + rejetés)")
+        return seen
 
     # -------------------------------------------------------------------------
-    # Fetch adaptatif [3]
+    # Fetch adaptatif
     # -------------------------------------------------------------------------
 
-    async def _fetch_url(self, url: str) -> Optional[str]:
+    async def _fetch_url(self, url: str, geo_code: str = "CA") -> Optional[str]:
         """
         Tente d'abord un fetch HTTP simple (rapide + pas cher).
         Si le body est vide ou trop court, repasse en browserHtml.
@@ -339,7 +427,7 @@ Si INVALIDE :
             response = await self.zyte_client.get({
                 "url": url,
                 "httpResponseBody": True,
-                "geolocation": "CA",
+                "geolocation": geo_code,
             })
             body_b64 = response.get("httpResponseBody", "")
             if body_b64:
@@ -352,7 +440,7 @@ Si INVALIDE :
             response2 = await self.zyte_client.get({
                 "url": url,
                 "browserHtml": True,
-                "geolocation": "CA",
+                "geolocation": geo_code,
             })
             return response2.get("browserHtml")
         except Exception as e:
@@ -361,15 +449,10 @@ Si INVALIDE :
 
     # =========================================================================
     # ÉTAPE 0 : Génération de l'ICP
-    # [C6] Cache cross-run uniquement (appelé 1x par run)
     # =========================================================================
 
     async def _generate_icp_raw(self, raw_phrase: str) -> ICPProfile:
-        # Pas de cache_control : _SYSTEM_ICP < 1024 tokens, le cache
-        # ne s'activerait pas sur Haiku. Annotating cache_control on a block
-        # below the minimum generates a silent no-op and wastes a round-trip.
         system_msg = SystemMessage(content=self._SYSTEM_ICP)
-
         user_msg = HumanMessage(content=(
             f"Voici ma phrase de départ :\n\n\"{raw_phrase}\"\n\n"
             "Génère l'ICP complet correspondant."
@@ -377,6 +460,8 @@ Si INVALIDE :
 
         response = await self.llm.ainvoke([system_msg, user_msg])
         self._track(response)
+
+        logger.info(f"[llm] Response ({len(response.content)} chars): {response.content[:300]}...")
 
         raw_data = parse_llm_json(response.content)
         if raw_data is None:
@@ -410,16 +495,14 @@ Si INVALIDE :
 
     # =========================================================================
     # ÉTAPE 1 : Génération des Google Dorks
-    # [C6] Cache cross-run uniquement (appelé 1x par run)
     # =========================================================================
 
     async def _generate_queries_raw(
         self, icp_description: str, offer_type: str, sub_sectors: list[str]
     ) -> list[str]:
-        # Pas de cache_control : _SYSTEM_DORKS < 1024 tokens.
-        system_msg = SystemMessage(content=self._SYSTEM_DORKS)
-
         sub_sectors_str = "\n".join(f"- {s}" for s in sub_sectors)
+
+        system_msg = SystemMessage(content=self._SYSTEM_DORKS)
         user_msg = HumanMessage(content=(
             f"<offer_type>{offer_type}</offer_type>\n\n"
             f"<icp_description>{icp_description}</icp_description>\n\n"
@@ -448,62 +531,67 @@ Si INVALIDE :
         return result or []
 
     # =========================================================================
-    # ÉTAPE 2 : Recherche SERP
+    # ÉTAPE 2 : Recherche SERP (avec pagination)
     # =========================================================================
 
-    async def _search_google_raw(self, query: str) -> list[str]:
-        logger.info(f"[serp] Requête : {query}")
+    async def _search_google_page(self, query: str, start: int, geo_code: str = "CA") -> list[str]:
+        """Fetche une page de résultats SERP (start=0 → p1, start=10 → p2…)."""
+        # Map le code pays vers le paramètre gl de Google (lowercase)
+        gl_param = geo_code.lower()
         response = await self.zyte_client.get({
-            "url": f"https://www.google.com/search?q={quote_plus(query)}&gl=ca&hl=fr",
+            "url": f"https://www.google.com/search?q={quote_plus(query)}&gl={gl_param}&hl=fr&start={start}",
             "serp": True,
-            "geolocation": "CA",
+            "geolocation": geo_code,
         })
         organic = response.get("serp", {}).get("organicResults", [])
-        urls = [r["url"] for r in organic if r.get("url")]
-        logger.info(f"[serp] {len(urls)} URLs extraites.")
+        return [r["url"] for r in organic if r.get("url")]
+
+    async def _search_google_raw(self, query: str, serp_pages: int = 3, geo_code: str = "CA") -> list[str]:
+        logger.info(f"[serp] Requête ({serp_pages}p) : {query}")
+        pages = await asyncio.gather(*[
+            self._search_google_page(query, start=i * 10, geo_code=geo_code)
+            for i in range(serp_pages)
+        ])
+        urls = [url for page in pages for url in page]
+        logger.info(f"[serp] {len(urls)} URLs extraites ({serp_pages} pages).")
         return urls
 
-    async def search_google(self, query: str) -> list[str]:
-        result = await retry_async(self._search_google_raw, query)
+    async def search_google(self, query: str, serp_pages: int = 3, geo_code: str = "CA") -> list[str]:
+        result = await retry_async(self._search_google_raw, query, serp_pages, geo_code)
         return result or []
 
     # =========================================================================
     # ÉTAPE 3 : Validation
-    # [C1-C4] Le system_message est reçu pré-construit depuis run()
-    # → identique byte-pour-byte sur tous les appels → cache hit garanti
     # =========================================================================
 
     async def _validate_raw(
         self,
         url: str,
-        system_msg: SystemMessage,   # [C4] pré-construit, pas rebuildi ici
+        system_msg: SystemMessage,
+        geo_code: str = "CA",
     ) -> Optional[dict]:
 
-        html = await self._fetch_url(url)
+        # PDFs illisibles → rejet immédiat, sans appel Zyte ni LLM
+        if url.lower().split("?")[0].endswith(".pdf"):
+            logger.debug(f"[valid] PDF ignoré (non-analysable) : {url}")
+            await self._persist_rejected(url, "Fichier PDF non-analysable.")
+            return None
+
+        html = await self._fetch_url(url, geo_code=geo_code)
         if not html:
             return None
 
         soup = BeautifulSoup(html, "html.parser")
         for tag in soup(["script", "style", "nav", "footer", "head"]):
             tag.decompose()
-        text_content = soup.get_text(separator=" ", strip=True)[:8000]
+        text_content = soup.get_text(separator=" ", strip=True)[:3500]
 
-        # User message = UNIQUEMENT le contenu du site (vraiment dynamique)
-        user_msg = HumanMessage(
-            content=f"<website_content>\n{text_content}\n</website_content>"
-        )
+        user_msg = HumanMessage(content=f"<website_content>\n{text_content}\n</website_content>")
 
-        response = await self.llm.ainvoke([system_msg, user_msg])
+        response = await self.llm_validate.ainvoke([system_msg, user_msg])
         self._track(response)
 
-        # Log du statut cache pour debug
-        meta = getattr(response, "usage_metadata", {}) or {}
-        cache_hit = meta.get("cache_read_input_tokens", 0)
-        logger.debug(
-            f"[cache] {url} — "
-            f"cache_read={cache_hit} tokens | "
-            f"{'✓ HIT' if cache_hit > 0 else '✗ MISS (1er appel ou TTL expiré)'}"
-        )
+        logger.info(f"[llm] Response ({len(response.content)} chars)")
 
         raw_data = parse_llm_json(response.content)
         if raw_data is None:
@@ -516,15 +604,16 @@ Si INVALIDE :
             else:
                 invalid = ProspectInvalid(**raw_data)
                 logger.info(f"[valid] Invalide ({url}) : {invalid.reason}")
+                await self._persist_rejected(url, invalid.reason)
                 return None
         except ValidationError as e:
             logger.error(f"[valid] Schéma Pydantic invalide pour {url} : {e}")
             return None
 
     async def validate_prospect_website(
-        self, url: str, system_msg: SystemMessage
+        self, url: str, system_msg: SystemMessage, geo_code: str = "CA"
     ) -> Optional[dict]:
-        return await retry_async(self._validate_raw, url, system_msg)
+        return await retry_async(self._validate_raw, url, system_msg, geo_code)
 
     # =========================================================================
     # ORCHESTRATEUR
@@ -535,13 +624,21 @@ Si INVALIDE :
         icp_description: str,
         offer_type: str,
         sub_sectors: list[str] | None = None,
-        max_urls: int = 100,
+        max_urls: int = 1000,
+        serp_pages: int = 3,
         max_concurrent_validations: int = 3,
         extra_excluded_domains: Optional[set[str]] = None,
+        icp_summary: str = "",  # Résumé court de l'ICP pour few-shots
+        geography: str = "",  # Géographie pour déterminer le code pays
     ) -> list[dict]:
 
         run_start = datetime.utcnow()
         effective_excluded = EXCLUDED_DOMAINS | (extra_excluded_domains or set())
+        seen_domains = self._load_seen_domains()
+
+        # Extraction du code pays depuis la géographie
+        geo_code = extract_geo_code(geography) if geography else "CA"
+        logger.info(f"[geo] Code pays : {geo_code} (depuis '{geography}')")
 
         # 1. Dorks — 2 par sous-secteur si disponibles, sinon fallback générique
         queries = await self.generate_search_queries(
@@ -551,36 +648,45 @@ Si INVALIDE :
             logger.error("Aucune requête générée. Arrêt.")
             return []
 
-        # 2. SERP parallèle
+        # 2. SERP parallèle avec pagination
         serp_results = await asyncio.gather(
-            *[self.search_google(q) for q in queries]
+            *[self.search_google(q, serp_pages, geo_code=geo_code) for q in queries]
         )
         all_urls: list[str] = []
         for url_list in serp_results:
             all_urls.extend(url_list)
 
         candidate_urls = filter_and_deduplicate_urls(
-            all_urls, max_urls, effective_excluded
+            all_urls, max_urls, effective_excluded,
+            already_seen=seen_domains if seen_domains else None,
         )
+
         logger.info(f"{len(candidate_urls)} URLs candidates (après filtre/dédup).")
 
-        # [C3][C4] Construit UNE SEULE FOIS pour tout le run.
-        # Toutes les validations reçoivent exactement le même objet
-        # → le bloc est mis en cache au 1er appel, lu depuis le cache
-        # sur tous les appels suivants (économie ~90% des tokens input).
+        # 2.5. Génération des few-shots dynamiques
+        few_shot_examples = await self.generate_few_shots(
+            icp_description=icp_description,
+            offer_type=offer_type,
+            icp_summary=icp_summary or icp_description[:200],
+        )
+
+        # Construit le system prompt de validation une seule fois
         validation_system_msg = self._build_validation_system_msg(
             icp_criteria=icp_description,
             offer_type=offer_type,
+            few_shot_examples=few_shot_examples,
         )
 
-        # 3. Validation concurrente
-        semaphore = asyncio.Semaphore(max_concurrent_validations)
+        # 3. Validation avec parallélisme
+        semaphore = asyncio.Semaphore(3)
+        _INTER_CALL_DELAY = 1.0
 
         async def bounded_validate(url: str):
             async with semaphore:
-                result = await self.validate_prospect_website(url, validation_system_msg)
+                result = await self.validate_prospect_website(url, validation_system_msg, geo_code=geo_code)
                 if result:
                     await self._persist_prospect(result)
+                await asyncio.sleep(_INTER_CALL_DELAY)
                 return result
 
         results = await asyncio.gather(
@@ -591,16 +697,10 @@ Si INVALIDE :
         # Rapport final
         cost = self.tracker.summary()
         duration = (datetime.utcnow() - run_start).total_seconds()
-        cache_savings_pct = (
-            round(cost["cache_read_tokens"] /
-                  max(cost["input_tokens"] + cost["cache_read_tokens"], 1) * 100, 1)
-        )
         logger.info(
             f"Run terminé en {duration:.1f}s | "
             f"{len(prospects)} prospects | "
-            f"Coût : ${cost['estimated_cost_usd']:.5f} | "
-            f"Cache read : {cost['cache_read_tokens']} tokens "
-            f"({cache_savings_pct}% des tokens input lus depuis le cache)"
+            f"Tokens : {cost['input_tokens']} in / {cost['output_tokens']} out"
         )
 
         return prospects

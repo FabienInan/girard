@@ -5,17 +5,139 @@ Utilitaires partagés entre tous les modules.
 import asyncio
 import json
 import logging
+import re
 from typing import Optional
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
+# Mapping géographie → code pays Zyte/Google
+GEO_TO_CODE = {
+    # Canada
+    "canada": "CA",
+    "québec": "CA",
+    "quebec": "CA",
+    "ontario": "CA",
+    "colombie-britannique": "CA",
+    "british columbia": "CA",
+    "alberta": "CA",
+    "manitoba": "CA",
+    "saskatchewan": "CA",
+    "nouveau-brunswick": "CA",
+    "new brunswick": "CA",
+    "nouvelle-écosse": "CA",
+    "nova scotia": "CA",
+    "terreneuve": "CA",
+    "newfoundland": "CA",
+    "montréal": "CA",
+    "montreal": "CA",
+    "toronto": "CA",
+    "vancouver": "CA",
+    "calgary": "CA",
+    "ottawa": "CA",
+    # France
+    "france": "FR",
+    "paris": "FR",
+    "lyon": "FR",
+    "marseille": "FR",
+    "bordeaux": "FR",
+    "lille": "FR",
+    "toulouse": "FR",
+    "nice": "FR",
+    # États-Unis
+    "usa": "US",
+    "united states": "US",
+    "états-unis": "US",
+    "etats-unis": "US",
+    "new york": "US",
+    "california": "US",
+    "californie": "US",
+    "texas": "US",
+    "florida": "US",
+    "floride": "US",
+    # Europe
+    "belgique": "BE",
+    "belgium": "BE",
+    "suisse": "CH",
+    "switzerland": "CH",
+    "luxembourg": "LU",
+    "allemagne": "DE",
+    "germany": "DE",
+    "royaume-uni": "GB",
+    "united kingdom": "GB",
+    "uk": "GB",
+    "espagne": "ES",
+    "spain": "ES",
+    "italie": "IT",
+    "italy": "IT",
+    "pays-bas": "NL",
+    "netherlands": "NL",
+    # Autre
+    "maroc": "MA",
+    "morocco": "MA",
+    "algérie": "DZ",
+    "algeria": "DZ",
+    "tunisie": "TN",
+    "tunisia": "TN",
+    "sénégal": "SN",
+    "senegal": "SN",
+    "côte d'ivoire": "CI",
+    "ivoire": "CI",
+}
+
+
+def extract_geo_code(geography: str) -> str:
+    """
+    Extrait un code pays Zyte/Google depuis une chaîne de géographie.
+    Retourne 'CA' par défaut si aucun match trouvé.
+
+    Exemples :
+      "PME françaises de 10-50 employés" → "FR"
+      "Entrepreneurs au Québec" → "CA"
+      "Companies in New York" → "US"
+    """
+    if not geography:
+        return "CA"
+
+    geo_lower = geography.lower()
+
+    # Cherche d'abord une correspondance directe
+    for key, code in GEO_TO_CODE.items():
+        if key in geo_lower:
+            return code
+
+    # Patterns communs
+    if re.search(r"\b(fr|français|france)\b", geo_lower):
+        return "FR"
+    if re.search(r"\b(ca|canada|québec|quebec)\b", geo_lower):
+        return "CA"
+    if re.search(r"\b(us|usa|united states|états-unis|etats-unis)\b", geo_lower):
+        return "US"
+
+    # Défaut
+    logger.info(f"[geo] Code pays non trouvé pour '{geography}', défaut: CA")
+    return "CA"
+
+
 EXCLUDED_DOMAINS = {
+    # Réseaux sociaux et annuaires
     "wikipedia.org", "linkedin.com", "facebook.com", "youtube.com",
     "instagram.com", "twitter.com", "x.com", "tiktok.com",
     "pages-jaunes.ca", "pagesjaunes.fr", "yelp.com", "yelp.ca",
     "google.com", "maps.google.com", "apple.com",
-    "gouvernement.qc.ca", "canada.ca",
+    # Gouvernements et institutions publiques
+    "gouvernement.qc.ca", "canada.ca", "gc.ca", "gouv.qc.ca",
+    "assnat.qc.ca", "ville.montreal.qc.ca",
+    # Universités et cégeps (pas des PME)
+    "uqam.ca", "umontreal.ca", "mcgill.ca", "concordia.ca",
+    "ulaval.ca", "usherbrooke.ca", "uqtr.ca", "uqo.ca",
+    "cegep", "cmontmorency.qc.ca", "cegep-rimouski.qc.ca",
+    # Ordres professionnels (pas des entreprises clientes)
+    "barreau.qc.ca", "cpaquebec.ca", "oiq.ca", "oaciq.com",
+    "camq.ca", "odq.qc.ca",
+    # Job boards
+    "indeed.ca", "glassdoor.ca", "jobillico.com", "monster.ca",
+    "emploiquebec.gouv.qc.ca",
 }
 
 # Seconds-level domains qui font partie du domaine racine (ex: company.qc.ca)
@@ -40,12 +162,20 @@ _EXCLUDE_PATHS = {
 }
 
 
-async def retry_async(coro_func, *args, max_retries=3, base_delay=2.0, **kwargs):
+async def retry_async(coro_func, *args, max_retries=5, base_delay=2.0, **kwargs):
     for attempt in range(max_retries):
         try:
             return await coro_func(*args, **kwargs)
         except Exception as e:
-            wait = base_delay * (2 ** attempt)
+            err_str = str(e)
+            # Respecte le Retry-After si présent (ex: 429 rate limit Anthropic = 60s)
+            retry_after = None
+            if "Retry-After" in err_str:
+                import re
+                m = re.search(r"'Retry-After':\s*'(\d+)'", err_str)
+                if m:
+                    retry_after = int(m.group(1))
+            wait = retry_after if retry_after else base_delay * (2 ** attempt)
             logger.warning(
                 f"[retry] {coro_func.__name__} tentative {attempt + 1}/{max_retries} "
                 f"— retry dans {wait:.0f}s ({e})"
@@ -58,15 +188,58 @@ async def retry_async(coro_func, *args, max_retries=3, base_delay=2.0, **kwargs)
 
 
 def parse_llm_json(raw: str) -> Optional[dict | list]:
+    """
+    Parse JSON from LLM output with repair attempts for common issues.
+    Handles: code blocks, trailing commas, missing commas, truncated JSON.
+    """
     if "```json" in raw:
         raw = raw.split("```json")[1].split("```")[0]
     elif "```" in raw:
         raw = raw.split("```")[1].split("```")[0]
+
+    raw = raw.strip()
+
+    # First attempt: direct parse
     try:
-        return json.loads(raw.strip())
-    except json.JSONDecodeError as e:
-        logger.error(f"Échec parsing JSON : {e} | Raw : {raw[:300]}")
-        return None
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    # Second attempt: repair trailing commas
+    # Remove commas before ] or }
+    repaired = re.sub(r',\s*([}\]])', r'\1', raw)
+    try:
+        return json.loads(repaired)
+    except json.JSONDecodeError:
+        pass
+
+    # Third attempt: fix missing commas between objects/items
+    # Pattern: "} {" or "] {" or "} [" should be "}, {" or "], {" or "}, ["
+    repaired = re.sub(r'([}\]])\s*([{\[])', r'\1, \2', raw)
+    try:
+        return json.loads(repaired)
+    except json.JSONDecodeError:
+        pass
+
+    # Fourth attempt: find JSON object/array boundaries
+    # Sometimes LLM adds text before/after
+    for start_char, end_char in [('{', '}'), ('[', ']')]:
+        start_idx = raw.find(start_char)
+        end_idx = raw.rfind(end_char)
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+            extracted = raw[start_idx:end_idx + 1]
+            try:
+                return json.loads(extracted)
+            except json.JSONDecodeError:
+                # Try repairs on extracted
+                repaired = re.sub(r',\s*([}\]])', r'\1', extracted)
+                try:
+                    return json.loads(repaired)
+                except json.JSONDecodeError:
+                    pass
+
+    logger.error(f"Échec parsing JSON après réparations | Raw : {raw[:500]}")
+    return None
 
 
 def extract_root_domain(domain: str) -> str:
@@ -111,15 +284,19 @@ def filter_and_deduplicate_urls(
     ordered_urls: list[str],
     max_urls: int,
     excluded: set[str] = EXCLUDED_DOMAINS,
+    already_seen: set[str] | None = None,
 ) -> list[str]:
     """
     Filtre, déduplique par domaine racine et trie par score qualifiant.
     - Un seul URL par domaine racine (company.qc.ca = www.company.qc.ca)
     - URLs parasites (blog, emplois…) exclues avant validation Claude
+    - Domaines déjà visités (already_seen) exclus avant application du cap
     - Résultat trié par score décroissant : pages /a-propos en premier
+    - Le cap max_urls est appliqué sur les URLs nouvelles uniquement
     """
     seen_roots: set[str] = set()
     candidates: list[tuple[int, str]] = []  # (score, url)
+    skipped_seen = 0
 
     for url in ordered_urls:
         domain = urlparse(url).netloc
@@ -132,6 +309,11 @@ def filter_and_deduplicate_urls(
             continue
         seen_roots.add(root)
 
+        if already_seen and root in already_seen:
+            skipped_seen += 1
+            logger.debug(f"[dedup] Déjà visité : {url}")
+            continue
+
         s = score_url(url)
         if s == -1:
             logger.debug(f"[dedup] Chemin parasite exclu : {url}")
@@ -143,7 +325,8 @@ def filter_and_deduplicate_urls(
     candidates.sort(key=lambda x: x[0], reverse=True)
     result = [url for _, url in candidates[:max_urls]]
     logger.info(
-        f"[dedup] {len(result)} URLs candidates "
+        f"[dedup] {len(result)} URLs nouvelles candidates "
+        f"({skipped_seen} déjà visitées ignorées) "
         f"(scores: {[s for s, _ in candidates[:max_urls]]})"
     )
     return result
