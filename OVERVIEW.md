@@ -116,6 +116,16 @@ OLLAMA_API_KEY=your_ollama_key
 OLLAMA_MODEL=ministral-3:8b
 ```
 
+### Available Models
+
+| Model | Size | Best For | Notes |
+|-------|------|----------|-------|
+| `ministral-3:8b` | 8B | Fast classification, validation | **Recommended default** |
+| `gemma3:12b` | 12B | Better ICP generation | Higher quality, slower |
+| `gpt-oss:20b` | 20B | Alternative | Good for complex tasks |
+
+**Avoid** "thinking" models (`qwen3.5`, `deepseek`) — they don't return clean JSON.
+
 Get your keys:
 - **Zyte:** https://zyte.com (for web scraping)
 - **Ollama:** https://ollama.com/settings (for AI)
@@ -203,8 +213,11 @@ Generate tailored cold emails using:
 
 ## Questions?
 
-**Q: Can I use my own AI model?**
-A: Yes. Change `OLLAMA_MODEL` in `.env`. Recommended: `ministral-3:8b` (fast) or `gemma3:12b` (better).
+**Q: Which model should I use?**
+A: Start with `ministral-3:8b` — it's fast and handles JSON well. Switch to `gemma3:12b` if you need more nuanced ICP generation.
+
+**Q: Can I use other AI providers?**
+A: Yes. The code uses LangChain, so you can swap Ollama for OpenAI, Anthropic, etc. Modify `modules/m1_prospect_finder.py` to use a different LLM.
 
 **Q: What countries does it support?**
 A: Any country. The AI detects geography from your description automatically (France, Canada, US, Germany, etc.).

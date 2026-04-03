@@ -108,41 +108,33 @@ class ProspectFinder:
 
     _SYSTEM_ICP = """
 <role>
-Tu es un stratège commercial B2B senior avec 15 ans d'expérience en définition
-de profils clients idéaux (ICP — Ideal Customer Profile).
-Tu transformes une intention commerciale floue en un ICP structuré, précis et
-directement exploitable par un agent de prospection automatisé.
+Tu es un stratège commercial B2B senior. Tu transformes une description commerciale
+en un ICP (Ideal Customer Profile) structuré pour la prospection automatisée.
 </role>
 
-<your_job>
-À partir d'une phrase libre décrivant une offre et/ou un prospect visé,
-tu extrais et enrichis toutes les dimensions nécessaires :
-- Qui est le prospect (secteur, taille, géographie, décideur)
-- Ce qu'on lui vend (type et description de l'offre)
-- Quels signaux d'achat chercher sur son site web
-- Quels problèmes ton offre résout pour lui
-- Quels domaines parasites exclure lors de la recherche
-</your_job>
-
 <output_rules>
-Retourne UNIQUEMENT un objet JSON valide respectant exactement ce schéma.
-Aucun texte avant ou après. Tous les champs sont obligatoires.
-IMPORTANT pour sub_sectors : génère UN sous-secteur distinct pour chaque type de profession
-ou secteur cité dans la phrase. Si 10 professions sont mentionnées, tu dois avoir ~10 sous-secteurs.
-Ne regroupe jamais des professions distinctes en un seul sous-secteur générique.
+Retourne UNIQUEMENT un JSON valide. Aucun texte avant ou après.
 
+RÈGLES IMPORTANTES:
+- sub_sectors : 5-8 sous-secteurs maximum, un par type de profession/secteur
+- buying_signals : 3-5 signaux maximum
+- pain_points : 3-5 maximum
+- icp_description : 2-3 phrases maximum
+- Sois concis, le JSON doit tenir en ~1000 caractères
+
+Schéma :
 {
   "sector": "Secteur principal",
-  "sub_sectors": ["sous-secteur 1", "sous-secteur 2", "...un sous-secteur distinct par type de profession ou secteur cité"],
+  "sub_sectors": ["s1", "s2", "..."],
   "company_size": "X à Y employés",
-  "geography": "Ville/Région/Pays ciblé",
-  "decision_maker_title": ["Titre décideur 1", "Titre décideur 2"],
+  "geography": "Pays/Région",
+  "decision_maker_title": ["Titre 1", "Titre 2"],
   "offer_type": "Produit | Service",
-  "offer_description": "Description courte de l'offre",
-  "buying_signals": ["Signal 1", "Signal 2", "Signal 3"],
-  "pain_points": ["Douleur 1", "Douleur 2", "Douleur 3"],
-  "icp_description": "Paragraphe synthétique de 3-5 phrases décrivant le prospect idéal et ses besoins",
-  "excluded_domains_extra": ["annuaire-sectoriel.ca", "forum-metier.com"]
+  "offer_description": "Description courte",
+  "buying_signals": ["s1", "s2", "s3"],
+  "pain_points": ["p1", "p2", "p3"],
+  "icp_description": "2-3 phrases",
+  "excluded_domains_extra": []
 }
 </output_rules>
 """
@@ -257,11 +249,14 @@ Aucun texte avant ou après. JSON strictement valide.
         # Client Ollama via langchain-ollama
         ollama_headers = {"Authorization": f"Bearer {OLLAMA_API_KEY}"}
 
+        # num_ctx=16384: context window for prompt + output
+        # num_predict=4096: max output tokens (Ollama Cloud requires positive int)
         self.llm = ChatOllama(
             model=OLLAMA_MODEL,
             base_url=OLLAMA_BASE_URL,
             temperature=0.2,
-            num_predict=8192,
+            num_ctx=16384,
+            num_predict=4096,
             client_kwargs={"headers": ollama_headers},
         )
 
@@ -269,7 +264,8 @@ Aucun texte avant ou après. JSON strictement valide.
             model=OLLAMA_MODEL,
             base_url=OLLAMA_BASE_URL,
             temperature=0.1,
-            num_predict=1024,
+            num_ctx=8192,
+            num_predict=2048,  # validation needs less, but enough for full JSON
             client_kwargs={"headers": ollama_headers},
         )
 
